@@ -1,0 +1,853 @@
+---
+title: "CTF446_scRNA_ver2"
+format: html
+editor: source
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+set.seed(8578)
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  results = "hide"
+)
+
+
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(knitr)
+library(ggplot2)
+library(cowplot)
+library(tidyverse)
+library(data.table)
+library(igraph)
+library(ggraph)
+library(clustree)
+library(HGNChelper)
+library(presto)
+library("SeuratExtend")
+```
+
+#1. QC, filtering, and normalisation
+##1.1 Data import
+
+```{r load data}
+
+## Load data (Rhapsody already a Seurat object with metadata from ST and TCR)
+
+
+gt <- 
+  readRDS(file = "CTF446_updatedfiles/CTF446-D11-GT-run4_Seurat.rds")
+
+##make a list of cell label for velocyto and export
+
+# cell_list <- Cells(gt)
+# 
+# writeLines(cell_list, con = "CTF446_updatedfiles/output/cell_list.txt", sep = "\n", useBytes = FALSE)
+
+# update Seurat object
+
+gt[["RNA"]] <- as(object =  gt[["RNA"]], Class = "Assay5")
+#
+#get bioproduct names for RNA
+rna_name <- rownames(gt)
+head(rna_name)
+
+#get RNA meta data
+
+rna <- GetAssayData(gt[["RNA"]], features = rna_name )
+
+#recreate seurat object
+
+gt[["RNA"]] <- CreateAssay5Object(counts = rna)
+
+head(gt[["RNA"]]$counts)
+
+#remove unidentified genes
+
+gt <- gt[!rownames(gt) %>% stringr::str_detect("Gm\\d{1,}|\\d{1,}Rik|ENSMUSG"), ]
+
+```
+
+## Remove multiplet and undetermined
+
+```{r multiplet and undetermined}
+
+gt@meta.data %>%
+  group_by(Sample_Name) %>%
+  tally(name = "cell_count") %>%
+  ggplot(aes(x = Sample_Name, y = cell_count, fill = Sample_Name)) +
+  geom_bar(stat = "identity") + 
+  geom_text(aes(y = cell_count, 
+                label = cell_count,
+                vjust = -0.5, size = 2.5), show.legend = F) +
+  scale_x_discrete(guide = guide_axis(angle = 45)) + 
+  theme_classic()
+
+#remove 
+
+gt <- subset(gt, subset = Sample_Name %in% c("Multiplet","Undetermined"), invert = T)
+
+
+
+```
+
+##1.2 QC
+
+
+```{r explore RNA content}
+
+# visualize QC metrics
+gt[["percent.mt"]] <- PercentageFeatureSet(gt, pattern = "^mt-")
+head(gt@meta.data, 5)
+
+VlnPlot(gt, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+p1 <- VlnPlot(gt, features = c("nFeature_RNA"))+ geom_hline(yintercept = 3000 , linetype = "dashed", color = "red") + theme(legend.position = "none")
+          
+p2 <- VlnPlot(gt, features = "percent.mt", y.max = 25) + geom_hline(yintercept = 12.5 , linetype = "dashed", color = "red") + theme(legend.position = "none")
+
+plot_grid(p1, p2, ncol = 2)
+
+plot1 <- FeatureScatter(gt, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(gt, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+#visualisation by samples
+
+gt@meta.data %>% 
+  ggplot(aes(color=Sample_Name, x=nCount_RNA, fill= Sample_Name)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  ggtitle("nCount_RNA")
+
+gt@meta.data %>% 
+  ggplot(aes(color=Sample_Name, x=nFeature_RNA, fill= Sample_Name)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  ggtitle("nFeature_RNA")
+
+gt@meta.data %>% 
+  ggplot(aes(color=Sample_Name, x=percent.mt, fill=Sample_Name)) + 
+  geom_density(alpha = 0.2) + 
+  theme_classic() +
+  ggtitle("percent.mt")
+
+gt@meta.data %>% 
+  ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=percent.mt)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 700, colour = "red") +
+  geom_hline(yintercept = 400, colour = "red") +
+  facet_wrap(~Sample_Name) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+"The data is fitted with a linear regression line. We expect when UMI counts increase, gene counts also increase.
+
+Upper right quadrant: Cells with high gene counts and UMI counts. We generally consider these cells to be good-quality cells.
+
+Bottom right quadrant: Cells with low gene counts and UMI counts. We generally consider these cells are low-quality cells.
+
+Darker cells: Cells with high mitochondrial percentage. Many of these cells have low gene counts at the same time. This may indicate damaged/dying cells whose cytoplasmic mRNA leaks out through a broken membrane, so only mRNA located in the mitochondria is still conserved.
+"
+
+```
+
+
+```{r filtering}
+
+"From the QC plot I will set a mild threshold (mt = 12,5 %)"
+
+gt_filtr <- subset(gt, subset = nFeature_RNA > 400 & nFeature_RNA < 3000 & percent.mt < 12.5 & nCount_RNA > 700 )
+
+VlnPlot(gt_filtr,features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, alpha = .2 )
+
+#assess filtration
+"Before filtering"
+gt@meta.data %>%
+  group_by(Sample_Name) %>%
+  dplyr::summarise(cell_number = length(Sample_Name))
+
+"After filtering"
+gt_filtr@meta.data %>%
+  group_by(Sample_Name) %>%
+  dplyr::summarise(cell_number = length(Sample_Name))
+```
+
+#Scaling, norm and findvariable features
+
+```{r}
+options(future.globals.maxSize= 600*1024^2)
+# run sctransform
+gt_norm <- SCTransform(gt_filtr)
+
+#run normalisation and scaling for RNA slot to use in downstream analysis such as celltypist, singleR, DE
+#SCT data use for clustering, UMAP, and integration
+
+gt_norm <-
+  NormalizeData(gt_norm, normalization.method = "LogNormalize", scale.factor = 10000, assay = "RNA")
+
+
+all.genes <- rownames(gt_norm)
+gt_norm <- ScaleData(gt_norm, features = all.genes, assay = "RNA")
+
+
+```
+
+
+##1.6 Linear dimensial reduction
+```{r PCA}
+set.seed(8578)
+gt_norm <- RunPCA(gt_norm, features = VariableFeatures(object = gt_norm))
+
+ElbowPlot(gt_norm, ndims = 50)
+
+
+
+#visualise
+
+print(gt_norm[["pca"]], dims =1:5, nfeatures = 5)
+
+VizDimLoadings(gt_norm, dims = 1:2, reduction = "pca")
+
+DimPlot(gt_norm, reduction = "pca") + NoLegend()
+
+DimHeatmap(gt_norm, dims= 1, cells = 500, balanced = TRUE)
+
+DimHeatmap(gt_norm, dims = 1:15, cells = 500, balanced = TRUE)
+
+
+# Determine percent of variation associated with each PC
+pct <- gt_norm[["pca"]]@stdev / sum(gt_norm[["pca"]]@stdev)*100
+
+# Calculate cumulative percents for each PC
+cumu = cumsum(pct)
+
+
+# Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5 and variation between consecutive PCs is less than 0.1 %
+co1 <- which(cumu > 90 & pct < 5)[1]
+
+co1
+
+# Determine the difference between variation of PC and subsequent PC
+co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+
+# last point where change of % of variation is more than 0.1%
+
+co2
+
+#minimum of the two calculation
+pcs <- min(co1, co2)
+pcs
+
+"Number of PCs chosen for downstream analysis: 13 (based on the elbow plot and calculation)"
+
+# Create a dataframe with values
+plot_df <- data.frame(pct = pct, 
+           cumu = cumu, 
+           rank = 1:length(pct))
+
+# Elbow plot to visualize 
+  ggplot(plot_df, aes(cumu, pct, label = rank, color = rank > pcs)) + 
+  geom_text() + 
+  geom_vline(xintercept = 90, color = "grey") + 
+  geom_hline(yintercept = min(pct[pct > 5]), color = "grey") +
+  theme_bw()
+
+
+```
+2. Downstream analysis
+##2.1 Clustering
+```{r Cluster}
+set.seed(8578)
+
+#cluster cells using KNN algorithm
+
+gt_norm <- FindNeighbors(gt_norm,  reduction = "pca", dims = 1:13)
+
+#UMAP use only the top 13 PCs
+
+gt_norm <- RunUMAP(gt_norm, reduction = "pca", dims = 1:13)
+
+
+DimPlot(gt_norm, reduction = "umap", split.by = "Sample_Name")
+
+
+DimPlot(gt_norm, reduction = "tsne", split.by = "Sample_Name")
+```
+
+
+```{r upload old gt norm}
+library("svglite")
+
+
+gt_norm <- FindClusters(gt_norm, resolution = c(0.05, 0.1, 0.2, 0.3),
+                         verbose = F)
+
+# gt_norm <- FindClusters(gt_norm, resolution = 0.1,verbose = F)
+
+#look at metadata for each resolution how many clusters
+# gt_norm@meta.data %>%
+#   dplyr::select(contains("RNA_snn")) %>%
+#   map_int(~ unique(.x) %>% length)
+
+"At resolution 0.1 we see nodes with multiple incoming edges - this is a good indication of overclustering.
+Here it might be good to chose the 0.05 as the resolution"
+
+#visualise clusters at different resolution to determine it
+
+clustree(gt_norm, prefix = "SCT_snn_res.")
+# 
+Idents(object = gt_norm) <- "SCT_snn_res.0.05"
+
+# Idents(gt_norm)
+# 
+# UMAP visualization
+y <- DimPlot(gt_norm, reduction = "umap", label = TRUE, label.size = 6)
+
+y
+
+```
+
+```{r CD4 clusters}
+
+"Remove clusters that are not CD4"
+T_cell_marker <- VlnPlot(gt_norm, features = c("Ptprc","Cd4", "Cd3e", "EYFP",  "Cd3g", "Thy1", "Epcam", "Cd8a", "Klrb1c", "Ncr1", "Pecam1"))
+
+T_cell_marker
+
+# ggsave("CTF446_updatedfiles/output/cluster_confirmCD4.svg", plot = T_cell_marker, width = 30, height = 30, units = "cm")
+
+library(scCustomize)
+
+perc.CD4.all <- Percent_Expressing(gt_norm, features = c( "Ptprc","Cd4", "Cd3e", "EYFP",  "Cd3g", "Thy1", "Epcam", "Cd8a", "Klrb1c", "Ncr1", "Pecam1" ), threshold = 1)
+
+perc.CD4.all
+# 
+# write.csv(perc.CD4.all, "CTF446_updatedfiles/output/perc_Tmarker2.csv", row.names = T)
+
+"Remove cluster 3"
+```
+
+# 3 VDJ analysis
+
+```{r}
+library(gsl)
+library(scRepertoire)
+library(data.table)
+
+tcr <- fread("CTF446_updatedfiles/CTF446-D11-GT-run4_VDJ_Dominant_Contigs_AIRR.tsv", sep="\t")  %>%
+  dplyr::rename(chain = locus,
+         barcode = cell_id,
+         reads = umi_count,
+         v_gene = v_call,
+         d_gene = d_call,
+         j_gene = j_call,
+         c_gene = c_call,
+         cdr3_nt = cdr3,
+         cdr3 = cdr3_aa)
+
+st <- fread("CTF446_updatedfiles/CTF446-D11-GT-run4_Sample_Tag_Calls.csv")
+
+#split data by sampletag and T cells by chain
+sample1 <- filter(tcr, barcode%in% (filter(st, Sample_Tag == "SampleTag05_mm") %>% .$Cell_Index), chain %in% c("TRB", "TRA", "TRG", "TRD"))
+sample2 <- filter(tcr, barcode%in% (filter(st, Sample_Tag == "SampleTag06_mm") %>% .$Cell_Index), chain %in% c("TRB", "TRA", "TRG", "TRD"))
+sample3 <- filter(tcr, barcode%in% (filter(st, Sample_Tag == "SampleTag07_mm") %>% .$Cell_Index), chain %in% c("TRB", "TRA", "TRG", "TRD"))
+sample4 <- filter(tcr, barcode%in% (filter(st, Sample_Tag == "SampleTag08_mm") %>% .$Cell_Index), chain %in% c("TRB", "TRA", "TRG", "TRD"))
+
+bd <- list(sample1, sample2, sample3, sample4)
+
+
+combined.tcr <- combineTCR(bd,
+                           samples = c("SampleTag05_mm", "SampleTag06_mm", "SampleTag07_mm", "SampleTag08_mm"),
+                           removeNA = FALSE,
+                           removeMulti = FALSE,
+                           filterMulti = FALSE)
+
+```
+
+
+```{r combine with seurat object}
+library(SingleCellExperiment)
+```
+
+
+```{r combine with seurat object}
+cell.barcodes <- rownames(gt_norm[[]])
+
+cell.barcodes <- paste0(gt_norm$Sample_Name ,"_", cell.barcodes)
+testing <- RenameCells(gt_norm, new.names = cell.barcodes)
+
+comb <- combineExpression(combined.tcr, testing, cloneCall = "gene",  group.by = "sample" ,proportion = TRUE)
+
+DimPlot(comb, group.by = "cloneSize")
+```
+
+```{r exclude clusters}
+
+VlnPlot(comb, features = c("Cd4", "Cd3e", "EYFP"))
+
+#filter irrelevant clusters
+# Exclude specific clusters
+exclude <- c(2)
+# Get the clusters that are not in the exclude list
+include_clusters <- setdiff(unique(comb@meta.data[["SCT_snn_res.0.05"]]), exclude)
+
+# Subset the Seurat object to include only the desired clusters
+comb <- subset(comb, idents = include_clusters)
+
+# # Ensure UMAP has been computed (run this if not already done)
+# if (!"umap" %in% Reductions(comb)) {
+#   gt_norm1 <- RunPCA(gt_norm, features = VariableFeatures(object = gt_norm))
+#   gt_norm1 <- RunUMAP(gt_norm, dims = 1:10)
+#}
+
+# UMAP visualization
+DimPlot(comb,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6)
+
+
+
+```
+
+
+# 4. reclustering
+```{r recluster}
+set.seed(8578)
+
+
+
+# Step 2: sctransform the data in the subset (if not already normalized)
+CD4_cluster <- SCTransform(comb)
+
+# Step 5: Perform PCA on the subset
+CD4_cluster <- RunPCA(CD4_cluster, features = VariableFeatures(object = CD4_cluster))
+
+# Determine percent of variation associated with each PC
+pct <- CD4_cluster[["pca"]]@stdev / sum(CD4_cluster[["pca"]]@stdev)*100
+
+# Calculate cumulative percents for each PC
+cumu = cumsum(pct)
+
+ElbowPlot(CD4_cluster, ndims = 50)
+
+```
+
+
+```{r recluster}
+# Step 6: cluster cells using KNN algorithm
+
+CD4_cluster <- FindNeighbors(CD4_cluster,  reduction = "pca", dims = 1:10)
+
+#UMAP use only the top 10 PCs
+
+CD4_cluster <- RunUMAP(CD4_cluster, reduction = "pca", dims = 1:10)
+
+DimPlot(CD4_cluster, reduction = "umap", label = TRUE, label.size = 6)
+
+
+# Step 7: Find neighbors and clusters (reclustering)
+CD4_cluster <- FindClusters(CD4_cluster, resolution = c(0.1,0.12,0.14,0.16,0.18,0.2), verbose = F)
+clustree(CD4_cluster, prefix = "SCT_snn_res.")
+
+Idents(object = CD4_cluster) <- "SCT_snn_res.0.16"
+
+y <- DimPlot(CD4_cluster, reduction = "umap", label = TRUE, label.size = 6)
+
+y
+```
+
+```{r}
+###make a piechart of the percentage of each cluster
+
+library(ggplot2)
+library(Seurat)
+library(dplyr)
+
+# Count cells per cluster
+cluster_counts <- CD4_cluster %>% 
+  Idents() %>%
+  table() %>%
+  as.data.frame()
+
+colnames(cluster_counts) <- c("cluster", "count")
+
+# Calculate percentage
+cluster_counts <- cluster_counts %>%
+  mutate(percent = round(100 * count / sum(count), 1))
+
+# Plot
+ggplot(cluster_counts, aes(x = "", y = percent, fill = cluster)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = paste0(percent, "%")), 
+            position = position_stack(vjust = 0.5),
+            color = "white",  # <- This makes the text white
+             size = 6
+            ) +
+  theme_void() +
+  theme(legend.title = element_blank())
+
+
+```
+
+##2.3 Marker identification
+```{r markers}
+
+# find markers for every cluster compared to all remaining cells
+#by default wilcoxon Rank test
+gt.markers <- FindAllMarkers(CD4_cluster, min.pct = 0.2, assay = "RNA")
+
+top10 <- gt.markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+top10_heatmap <- DoHeatmap(CD4_cluster, features = unique(top10$gene)) 
+top10_heatmap
+
+#ggsave("CTF446_updatedfiles/output/paper/top10_heatmap.png", plot = last_plot(), units = "cm", width = 10, height = 30)
+```
+
+##dotplots genes
+
+```{r}
+
+library(SCpubr)
+
+genes1 <- list("Th17" = c(
+  "Il17a", "Il17f", "Il22", "Csf2",
+  "Rorc", "Stat3","Ccr6", "Il23r"),
+              "Th1" = c(
+  "Ifng", "Il2", "Tnf","Tbx21", "Stat1", "Stat4", "Runx3"),
+              "Th2" = c(
+  "Il4", "Il5", "Il13","Gata3", "Stat6"),
+              "TFH" = c( "Il21", "Il4",
+  "Bcl6", "Maf", "Tox2","Cxcr5", "Pdcd1"),
+              "Treg" = c("Foxp3", "Il10", "Tgfb1"),
+              "Cytotoxic" = c("Gzmb", "Gzma", "Prf1", "Nkg7", "Fasl", "Klrc1", "Klrc2", "Klrk1", "Cd107a"),
+                              "Other" = c("Cd40lg", "Bhlhe40"))
+
+
+
+
+p <- SCpubr::do_DotPlot(sample = CD4_cluster, 
+                        features = genes1,
+                        sequential.palette = "YlOrRd" )
+p
+
+#ggsave("CTF446_updatedfiles/output/paper/CD4subset_scpubr.png", plot = last_plot(), units = "cm", width = 30, height = 10)
+
+```
+
+
+```{r}
+library(RColorBrewer)
+genes2 <- list("Memory" = c(
+  "Il7r",    # IL-7 receptor, supports survival
+  "Tcf7", # Transcription factor driving memory formation
+  "Lef1",
+  "Bcl2",    # Anti-apoptotic gen
+  "Id2", # Regulates differentiation toward memory
+  "Id3",
+  "Fas",
+  "Cd27", 
+  "Sell",    # CD62L synonym
+  "Ccr7",    # Lymphoid homing, central memory
+  "Eomes"   # Long-lived memory transcription factor
+  ),
+"Activation" = c("Il15ra",
+  "Il2ra",    # CD25, involved in memory precursor activation
+  "Cd44",    # Memory marker
+  "Icos",
+  "Cd28",
+  "Lag3",
+  "Klrg1",
+  "Pdcd1",
+  "Havcr2",
+  "Ctla4"),
+              "Trafficking/residency" = c("S1pr1","Cxcr6", "Cxcr3", "Ccr5", "Cd69", "Itga4", "Itgb1", "Itgae", "Itga1", "Itgal", "Notch1","Zfp683", "Prdm1", "Runx3","Ahr", "Crtam", "Cd101"))
+
+
+
+
+p <- do_DotPlot(
+  sample = CD4_cluster,
+  features = genes1
+)
+
+p
+
+q <- SCpubr::do_DotPlot(sample = CD4_cluster, 
+                        features = genes2,
+                        sequential.palette = "YlOrRd")
+q
+
+
+#ggsave("CTF446_updatedfiles/output/paper/CD4type_scpubr.png", plot = last_plot(), units = "cm", width = 30, height = 10)
+
+```
+
+
+###renaming cluster id
+```{r}
+new.cluster.ids <- c("Int. Th", "ISG+", "Tcf7+", "Teff", "Th17")
+names(new.cluster.ids) <- levels(CD4_cluster)
+CD4_cluster <- RenameIdents(CD4_cluster, new.cluster.ids)
+
+y <- DimPlot(CD4_cluster, reduction = "umap", label = F, label.size = 6) + NoLegend()
+
+y
+
+y<- LabelClusters(
+  plot = y,
+  id = "ident",
+  repel = TRUE,
+  size = 6,
+  box = TRUE,
+  fill = alpha("white", 0.75),  # 75% transparent white
+  color = "black"               # black text
+)
+
+y <- y + labs(
+  x = "UMAP 2",
+  y = "UMAP 1") + theme_umap_arrows()
+y
+
+#ggsave("CTF446_updatedfiles/output/paper/new_clusterID.png", plot = y, units = "cm", width = 15, height = 10)
+#saveRDS(CD4_cluster, "CTF446_updatedfiles/seu2.rds")
+```
+
+
+#5 Top clonotypes
+
+#Clonotype information our of all cells
+
+```{r}
+
+library(SingleCellExperiment)
+library(singleCellTK)
+
+colorblind_vector <- hcl.colors(n=7, palette = "inferno", fixup = TRUE)
+
+clonaloverlap <-clonalOverlap(CD4_cluster,
+              cloneCall = "strict",
+              method = "morisita")
+
+#ggsave("CTF446_updatedfiles/output/paper/clonaloverlap.png", plot = clonaloverlap , units = "cm", width = 15, height = 10)
+
+```
+
+##clonesize
+
+```{r}
+y <- DimPlot(CD4_cluster, group.by = "cloneSize", pt.size = 1.5 ) +
+    scale_color_manual(values=rev(colorblind_vector[c(1,3,5,7)]))
+
+y <- y + labs(
+  x = "UMAP 2",
+  y = "UMAP 1") + theme_umap_arrows()
+y
+
+#ggsave("CTF446_updatedfiles/output/paper/clonesize_umap.svg", plot = y, units = "cm", width = 15, height = 10)
+
+```
+
+
+
+##Frequency of top10 clonotypes
+##Top clonotypes
+
+
+```{r}
+###top50_frequency
+# 1. Extract clonalProportion column, remove NA
+clonal_freq_values <- CD4_cluster@meta.data[["clonalProportion"]]
+clonal_freq_values <- na.omit(clonal_freq_values)
+
+# 2. Get unique clonalProportion values
+unique_clonal_freq <- unique(clonal_freq_values)
+
+# 3. Sort unique values in descending order
+sorted_clonal_freq <- sort(unique_clonal_freq, decreasing = TRUE)
+
+print(sorted_clonal_freq)
+
+# 4. Slice the top 50 values
+top_50_clonal_freq <- head(sorted_clonal_freq, 100)
+
+# 5. Print top 50
+print(top_50_clonal_freq)
+
+percentage <- (top_50_clonal_freq*100)
+
+# Load ggplot2 for plotting
+library(ggplot2)
+
+
+# Create a data frame for plotting
+percentage_df <- data.frame(
+  Percentage = percentage
+)
+
+# Create the bar plot
+perc <- ggplot(percentage_df, aes(x = factor(1:length(percentage)), y = Percentage)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Total 6,726 clones detected",
+    x = "All Clonotypes",
+    y = "Percent of total clonotypes(%)"
+  ) +
+  theme(axis.text.x = element_blank())  # Remove x-axis labels
+
+#ggsave("CTF446_updatedfiles/output/paper/clonotype_percentage.png", plot = perc, units = "cm", width = 15, height = 10)
+
+```
+
+## Top6 clonotypes
+```{r}
+#extract top6 clonotypes, CTstrict equivalent to clonotype
+# counts per strict clonotype
+ct_counts <- sort(table(CD4_cluster@meta.data$CTstrict), decreasing = TRUE)
+
+# top 6 clonotype names
+top6_strict_names <- names(ct_counts)[1:6]
+
+# subset metadata for those exact clonotypes (guarantees 6 clonotype labels)
+top6_metadata_strict <- CD4_cluster@meta.data[CD4_cluster@meta.data$CTstrict %in% top6_strict_names, ]
+
+# sanity checks
+length(top6_strict_names)            # should be 6
+table(top6_metadata_strict$CTstrict) # counts for each of the top 6
+
+# Extract top 6 names as a character vector
+top6_CTstrict_vector <- names(ct_counts)[1:6]
+
+top6_CTstrict_vector
+
+#subset top6 clonotypes for scVelo
+
+CD4_top6 <- subset(
+  CD4_cluster,
+  subset = CTstrict %in% top6_CTstrict_vector
+)
+
+#saveRDS(CD4_top6, "Celltypist/seu_top6clones.rds")
+
+```
+
+
+
+```{r}
+library("APackOfTheClones")
+
+
+CD4_cluster <- RunAPOTC(CD4_cluster, run_id = "first", clonecall = "strict", override = T)
+
+clone_plot <- APOTCPlot(CD4_cluster, run_id = "first", clonecall = "strict", legend_buffer = -1)
+
+clone_plot
+
+
+library(viridis)
+
+clones <- showCloneHighlight(clone_plot,
+    clonotype = top6_CTstrict_vector,
+    color_each = c(red     = "#CD2626",
+  orange  = "#FF7F24",
+  yellow  = "#FFD700",
+  green   = "#00CD00",
+  blue    = "#009ACD",
+  purple  = "#8B4789"),
+  # pink    = "#FF69B4",  
+  # brown    = "#8B4513",  
+  # beige    = "#FAFAD2",  
+  # black  = "#030303" 
+    scale_bg = 0.95, 
+    fill_legend = F) + theme_umap_arrows()
+
+clones 
+
+#ggsave("CTF446_updatedfiles/output/paper/top6clonotypes.png", plot = clones, units = "cm", width = 20, height = 15)
+
+```
+
+##2.5 Trajectory analysis Monocle
+```{r}
+library(monocle3)
+library(SeuratWrappers)
+library(tidyverse)
+
+
+cds <- as.cell_data_set(CD4_cluster, group.by = "ident")
+colData(cds)
+
+plot_cells(cds, color_cells_by = "ident",
+           label_groups_by_cluster = FALSE,
+           group_label_size = 5) +
+  theme(legend.position = "right")
+
+
+#learn the graph for trajectory inference
+#As we have already the UMAP information from the seurat object so we just need to cluster the cells from the umap information from the seurat
+cds <- cluster_cells(cds, resolution = 9e-5)
+
+cds <- learn_graph(cds, use_partition = FALSE)
+
+trajectory_mono <- plot_cells(cds, color_cells_by = "cluster",
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           trajectory_graph_color = "#030303",
+           trajectory_graph_segment_size = 1,
+           label_groups_by_cluster = TRUE) + theme_umap_arrows() + 
+  theme_void() + 
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  )+ theme(legend.position = "none")
+
+trajectory_mono
+
+#ggsave("CTF446_updatedfiles/output/paper/trajectory_mono.png", plot = trajectory_mono, units = "cm", width = 15, height = 10)
+
+
+```
+
+#Slingshot trajectory
+
+```{r}
+library("SeuratExtend")
+
+CD4_cluster <- RunSlingshot(
+  CD4_cluster,
+  group.by = "SCT_snn_res.0.16",
+  reducedDim = "PCA"
+)
+
+sling <- CD4_cluster@misc$slingshot$PCA$SlingPseudotime
+
+CD4_cluster@meta.data[,colnames(sling)] <- as.data.frame(sling)
+
+DimPlot2(CD4_cluster, features=colnames(sling), cols = "C", theme = NoAxes())
+
+trajectory_sling <- DimPlot.Slingshot(CD4_cluster, theme = NoAxes()) + theme_umap_arrows()
+
+trajectory_sling
+
+#ggsave("CTF446_updatedfiles/output/paper/trajectoryLine_slingshot.png", plot = trajectory_sling, units = "cm", width = 15, height = 10)
+
+```
+
